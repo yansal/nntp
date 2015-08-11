@@ -1,74 +1,59 @@
 package nntp
 
 import (
-	"bufio"
-	"errors"
 	"fmt"
-	"net"
+	"net/textproto"
 	"strconv"
 	"strings"
 )
 
 type Conn struct {
-	net.Conn
-	*bufio.Scanner
+	*textproto.Conn
+	message string
 }
 
 func Dial(network, address string) (*Conn, error) {
-	netConn, err := net.Dial(network, address)
+	textprotoConn, err := textproto.Dial(network, address)
 	if err != nil {
 		return nil, err
 	}
 
-	conn := Conn{netConn, bufio.NewScanner(netConn)}
-
-	ok := conn.Scan()
-	if !ok {
-		return nil, conn.Err()
+	conn := Conn{textprotoConn, ""}
+	_, message, err := conn.ReadCodeLine(200)
+	if err != nil {
+		return nil, err
 	}
-	resp := conn.Text()
-	if resp[:3] != "200" {
-		return nil, errors.New(resp)
-	}
+	conn.message = message
 	return &conn, nil
 }
 
 func (conn *Conn) ModeReader() error {
-	fmt.Fprintln(conn, "MODE READER")
-	ok := conn.Scan()
-	if !ok {
-		return conn.Err()
+	id, err := conn.Cmd("MODE READER")
+	if err != nil {
+		return err
 	}
-	resp := conn.Text()
-	if resp[:3] != "200" {
-		return errors.New(resp)
+	conn.StartResponse(id)
+	defer conn.EndResponse(id)
+
+	if _, _, err = conn.ReadCodeLine(200); err != nil {
+		return err
 	}
 	return nil
 }
 
 func (conn *Conn) List() ([]string, error) {
-	fmt.Fprintln(conn, "LIST")
-	ok := conn.Scan()
-	if !ok {
-		return nil, conn.Err()
-	}
-	resp := conn.Text()
-	if resp[:3] != "215" {
-		return nil, errors.New(resp)
-	}
-
-	list := make([]string, 0)
-	for conn.Scan() {
-		text := conn.Text()
-		if text == "." {
-			break
-		}
-		list = append(list, text)
-	}
-	if err := conn.Err(); err != nil {
+	id, err := conn.Cmd("LIST")
+	if err != nil {
 		return nil, err
 	}
-	return list, nil
+	conn.StartResponse(id)
+	defer conn.EndResponse(id)
+
+	if _, _, err = conn.ReadCodeLine(215); err != nil {
+		return nil, err
+	}
+
+	return conn.ReadDotLines()
 }
 
 type Group struct {
@@ -76,26 +61,8 @@ type Group struct {
 	headers     []string
 }
 
-func (conn *Conn) Group(group string) (Group, error) {
-	fmt.Fprintln(conn, fmt.Sprintf("GROUP %s", group))
-	ok := conn.Scan()
-	if !ok {
-		return Group{}, conn.Err()
-	}
-	resp := conn.Text()
-	if resp[:3] != "211" {
-		return Group{}, errors.New(resp)
-	}
-
-	fields := strings.Fields(resp)
-	if len(fields) < 5 {
-		return Group{}, fmt.Errorf("GROUP: Can't parse %v", resp)
-	}
-	first, err := strconv.Atoi(fields[2])
-	if err != nil {
-		return Group{}, err
-	}
-	last, err := strconv.Atoi(fields[3])
+func (conn *Conn) Group(s string) (Group, error) {
+	group, err := conn.groupCmd(s)
 	if err != nil {
 		return Group{}, err
 	}
@@ -104,33 +71,58 @@ func (conn *Conn) Group(group string) (Group, error) {
 	if err != nil {
 		return Group{}, err
 	}
+	group.headers = headers
+	return group, nil
+}
 
-	return Group{first: first, last: last, headers: headers}, nil
+func (conn *Conn) groupCmd(s string) (Group, error) {
+	id, err := conn.Cmd("GROUP %s", s)
+	if err != nil {
+		return Group{}, err
+	}
+	conn.StartResponse(id)
+	defer conn.EndResponse(id)
+
+	_, msg, err := conn.ReadCodeLine(211)
+	if err != nil {
+		return Group{}, err
+	}
+
+	fields := strings.Fields(msg)
+	if len(fields) < 4 {
+		return Group{}, fmt.Errorf("GROUP: Can't parse %v", msg)
+	}
+	first, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return Group{}, err
+	}
+	last, err := strconv.Atoi(fields[2])
+	if err != nil {
+		return Group{}, err
+	}
+	return Group{first: first, last: last}, nil
 }
 
 func (conn *Conn) ListOverviewFmt() ([]string, error) {
-	fmt.Fprintln(conn, "LIST OVERVIEW.FMT")
-	ok := conn.Scan()
-	if !ok {
-		return nil, conn.Err()
-	}
-	resp := conn.Text()
-	if resp[:3] != "215" {
-		return nil, errors.New(resp)
-	}
-
-	headers := make([]string, 0)
-	for conn.Scan() {
-		text := conn.Text()
-		if text == "." {
-			break
-		}
-		headers = append(headers, text)
-	}
-	if err := conn.Err(); err != nil {
+	id, err := conn.Cmd("LIST OVERVIEW.FMT")
+	if err != nil {
 		return nil, err
 	}
-	return headers, nil
+	conn.StartResponse(id)
+	defer conn.EndResponse(id)
+
+	if _, _, err := conn.ReadCodeLine(215); err != nil {
+		return nil, err
+	}
+
+	lines, err := conn.ReadDotLines()
+	if err != nil {
+		return nil, err
+	}
+	for i := range lines {
+		lines[i] = strings.TrimSuffix(lines[i], ":")
+	}
+	return lines, nil
 }
 
 type Article struct {
@@ -140,34 +132,39 @@ type Article struct {
 func (conn *Conn) Xover(group Group) ([]Article, error) {
 	first := group.first
 	last := group.last
-	fmt.Fprintln(conn, fmt.Sprintf("XOVER %d-%d", first, last))
-	ok := conn.Scan()
-	if !ok {
-		return nil, conn.Err()
+
+	id, err := conn.Cmd("XOVER %d-%d", first, last)
+	if err != nil {
+		return nil, err
 	}
-	resp := conn.Text()
-	if resp[:3] != "224" {
-		return nil, errors.New(resp)
+	conn.StartResponse(id)
+	defer conn.EndResponse(id)
+
+	if _, _, err := conn.ReadCodeLine(224); err != nil {
+		return nil, err
 	}
 
 	articles := make([]Article, 0)
 	var count int
-	for conn.Scan() {
-		text := conn.Text()
-		if text == "." {
+	for {
+		line, err := conn.ReadLine()
+		if err != nil {
+			return nil, err
+		}
+
+		if line == "." {
 			break
 		}
+
 		count++
 		fmt.Printf("\r%d / %d", count, last-first)
-		split := strings.Split(text, "\t")
+		split := strings.Split(line, "\t")
 		a := Article{make(map[string]string)}
 		for i, h := range group.headers {
 			a.Headers[h] = split[i+1]
 		}
 		articles = append(articles, a)
 	}
-	if err := conn.Err(); err != nil {
-		return nil, err
-	}
+
 	return articles, nil
 }
